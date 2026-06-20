@@ -1,0 +1,2 @@
+# Scripts de shell SIEMPRE con saltos LF (si no, fallan en Linux con error ^M / bad interpreter)
+*.sh text eol=lf
