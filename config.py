@@ -92,6 +92,18 @@ STOP_LOSS_BALANCE: Decimal | None = _opt_stop_loss("STOP_LOSS_BALANCE")
 STALE_SIGNAL_HOURS: int = int(_opt("STALE_SIGNAL_HOURS", "12"))
 
 # ----------------------------------------------------------------------
+#  Robustez (red inestable: telethon e IQ se caen y reconectan)
+# ----------------------------------------------------------------------
+# Polling fallback de Telegram: cada N seg releemos los ultimos mensajes del canal y
+# procesamos los que el handler en vivo se haya perdido durante una desconexion. Dedup por id.
+POLL_INTERVAL_SECONDS: int = int(_opt("POLL_INTERVAL_SECONDS", "30"))
+POLL_LIMIT: int = int(_opt("POLL_LIMIT", "15"))
+
+# Keep-alive IQ Option: cada N seg verificamos la conexion y reconectamos si cayo,
+# para que IQ este listo cuando dispare una senal (la lib se cae sola seguido).
+IQ_KEEPALIVE_SECONDS: int = int(_opt("IQ_KEEPALIVE_SECONDS", "30"))
+
+# ----------------------------------------------------------------------
 #  Logs
 # ----------------------------------------------------------------------
 LOG_DIR: Path = Path(_opt("LOG_DIR", "logs"))

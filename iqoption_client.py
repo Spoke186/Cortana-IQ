@@ -24,6 +24,7 @@ devuelve stake) se trata como won con profit 0 y se loguea.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -31,24 +32,50 @@ from decimal import Decimal
 
 from iqoptionapi.stable_api import IQ_Option
 import iqoptionapi.constants as OP_code
+from websocket._exceptions import WebSocketConnectionClosedException
 
 import config
 import logger
 
 
-# La lib lanza KeyError('underlying') en su hilo de digital options (GetUnderlyingList V2 no
-# soportado por el backend actual). Usamos TURBO, no digital -> silenciamos SOLO ese ruido de
-# hilo para no ensuciar stderr en cada get_all_open_time. Cualquier otra excepcion se respeta.
+# La lib iqoptionapi corre HILOS de fondo (__get_binary_open / __get_digital_open) que
+# revientan en cascada cuando el ws se cae: KeyError('underlying') (digital V2 no soportado)
+# y WebSocketConnectionClosedException (ws cerrado). Son RUIDO: nuestro keep-alive (ensure_connected)
+# es quien reconecta de verdad. Silenciamos SOLO ese ruido de esos hilos; cualquier otra
+# excepcion se respeta y se propaga normal.
 _prev_excepthook = threading.excepthook
 
 
-def _quiet_digital_hook(args):
-    if args.exc_type is KeyError and "underlying" in str(args.exc_value):
+def _quiet_iq_thread_hook(args):
+    val = str(args.exc_value)
+    if args.exc_type is KeyError and "underlying" in val:
+        return
+    if args.exc_type is WebSocketConnectionClosedException:
+        return
+    if "Connection is already closed" in val or "socket is already closed" in val:
         return
     _prev_excepthook(args)
 
 
-threading.excepthook = _quiet_digital_hook
+threading.excepthook = _quiet_iq_thread_hook
+
+# La lib loguea con logging.error('**error** api.get_instruments need reconnect', ...) al root
+# logger en cada caida del ws -> inunda run_overnight.log. Subimos el umbral de SUS loggers a
+# CRITICAL; nuestros logger.log_error (errors.log) no se tocan.
+for _name in ("iqoptionapi", "iqoptionapi.ws.client", "websocket"):
+    logging.getLogger(_name).setLevel(logging.CRITICAL)
+
+
+class _DropIqNoise(logging.Filter):
+    """La lib hace logging.error('**error** ... need reconnect') al ROOT logger. Filtramos esas."""
+    _NOISE = ("need reconnect", "Connection is already closed", "get_all_init_v2 late")
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        msg = record.getMessage()
+        return not any(n in msg for n in self._NOISE)
+
+
+logging.getLogger().addFilter(_DropIqNoise())
 
 
 # ----------------------------------------------------------------------
@@ -127,6 +154,14 @@ class IQClient:
             raise RuntimeError(f"Login IQ fallo: {reason!r}")
         mode = "REAL" if config.IQ_ACCOUNT_TYPE.lower() == "real" else "PRACTICE"
         iq.change_balance(mode)
+        # CRITICO: OP_code.ACTIVES de la lib viene CONGELADO/viejo (382 assets) y NO trae muchos
+        # pares -OTC que IQ abre en fin de semana (EURCHF-OTC, EURNZD-OTC, AUDJPY-OTC...). Sin
+        # esto, esos pares se reportan "cerrado/no existe" y NO se puede ni detectar ni comprar.
+        # update_ACTIVES_OPCODE() refresca ACTIVES desde el server (611 assets) con sus ids reales.
+        try:
+            iq.update_ACTIVES_OPCODE()
+        except Exception as exc:  # noqa: BLE001 - si falla, seguimos con la lista vieja y logueamos
+            logger.log_error("iq.update_actives", exc)
         return iq
 
     async def connect(self) -> None:
@@ -143,6 +178,31 @@ class IQClient:
     async def disconnect(self) -> None:
         # iqoptionapi no expone un close limpio; soltamos la referencia.
         self.iq = None
+
+    def _is_connected_sync(self) -> bool:
+        if self.iq is None:
+            return False
+        try:
+            return bool(self.iq.check_connect())
+        except Exception:  # noqa: BLE001 - si ni siquiera responde, tratarlo como caido
+            return False
+
+    async def is_connected(self) -> bool:
+        return await self._run(self._is_connected_sync)
+
+    async def ensure_connected(self) -> bool:
+        """
+        Keep-alive: si el ws de IQ cayo, reconecta. Devuelve True si quedo conectado.
+        La lib iqoptionapi pierde el ws seguido; esto lo levanta antes de que dispare una senal.
+        """
+        if await self.is_connected():
+            return True
+        try:
+            await self.reconnect()
+        except Exception as exc:  # noqa: BLE001 - ya logueado en reconnect; no romper el watchdog
+            logger.log_error("iq.ensure_connected", exc)
+            return False
+        return await self.is_connected()
 
     # ---- lecturas -----------------------------------------------------
     async def get_balance(self) -> Decimal:

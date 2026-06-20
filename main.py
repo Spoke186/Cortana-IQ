@@ -278,6 +278,78 @@ async def handle_message(text: str, broker: broker_mod.IQClient) -> None:
 
 
 # ----------------------------------------------------------------------
+#  Dedup entre el handler en vivo y el polling fallback
+# ----------------------------------------------------------------------
+# Ids de mensajes ya vistos (por cualquiera de las dos vias). Asyncio es de un solo hilo:
+# el check+add antes del primer await es atomico, asi que no hay doble procesamiento.
+_seen_ids: set[int] = set()
+
+
+def _remember(msg_id: int) -> bool:
+    """Devuelve True si es la PRIMERA vez que vemos este id (y lo marca). False si repetido."""
+    if msg_id in _seen_ids:
+        return False
+    _seen_ids.add(msg_id)
+    # Cota de memoria: en un dia entran pocos cientos; si crece mucho, recortamos los viejos.
+    if len(_seen_ids) > 5000:
+        for old in sorted(_seen_ids)[:2500]:
+            _seen_ids.discard(old)
+    return True
+
+
+async def process_message(text: str, msg_id: int, broker: broker_mod.IQClient) -> None:
+    """Punto unico de entrada (vivo + polling). Deduplica por id antes de accionar."""
+    if not _remember(msg_id):
+        return
+    await handle_message(text, broker)
+
+
+# ----------------------------------------------------------------------
+#  Polling fallback (§ robustez): si telethon se cae, NO perdemos senales.
+# ----------------------------------------------------------------------
+async def poll_channel(client, broker: broker_mod.IQClient) -> None:
+    """
+    Cada POLL_INTERVAL_SECONDS relee los ultimos POLL_LIMIT mensajes del canal y procesa
+    los que el handler en vivo se haya perdido (desconexion). Dedup por id via process_message.
+    """
+    from listener import channel_ref
+    ref = channel_ref()
+    while True:
+        try:
+            msgs = await client.get_messages(ref, limit=config.POLL_LIMIT)
+            # get_messages devuelve del mas nuevo al mas viejo -> procesar en orden cronologico.
+            for m in reversed(msgs):
+                text = getattr(m, "raw_text", None) or getattr(m, "message", None) or ""
+                mid = int(m.id)
+                if text:
+                    await process_message(text, mid, broker)
+        except Exception as exc:  # noqa: BLE001 - el watchdog nunca debe morir
+            logger.log_error("poll_channel", exc)
+        await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+
+
+# ----------------------------------------------------------------------
+#  Keep-alive de IQ Option (§ robustez): la lib pierde el ws seguido.
+# ----------------------------------------------------------------------
+async def iq_keepalive(broker: broker_mod.IQClient) -> None:
+    """Cada IQ_KEEPALIVE_SECONDS verifica la conexion IQ y reconecta si cayo. Avisa al recuperar."""
+    was_down = False
+    while True:
+        try:
+            ok = await broker.ensure_connected()
+            if not ok and not was_down:
+                was_down = True
+                await notify("⚠️ IQ Option desconectado. Reintentando reconexion en background...")
+                logger.log_error("iq_keepalive", "IQ caido, reconectando")
+            elif ok and was_down:
+                was_down = False
+                await notify("🔌 IQ Option reconectado. Operativa restaurada.")
+        except Exception as exc:  # noqa: BLE001 - el watchdog nunca debe morir
+            logger.log_error("iq_keepalive", exc)
+        await asyncio.sleep(config.IQ_KEEPALIVE_SECONDS)
+
+
+# ----------------------------------------------------------------------
 #  Arranque
 # ----------------------------------------------------------------------
 async def amain() -> None:
@@ -294,18 +366,37 @@ async def amain() -> None:
         logger.log_error("amain.balance", exc)
         await notify("🟢 Bot iniciado (no se pudo leer balance inicial; ver errors.log).")
 
-    client = build_client(lambda t: handle_message(t, broker))
+    client = build_client(lambda t, mid: process_message(t, mid, broker))
     await client.start()
     me = await client.get_me()
     print(f"Telethon conectado como: {getattr(me, 'username', None) or getattr(me, 'id', '?')}")
     # Cargar dialogos cachea las entidades (incl. el canal con su access_hash). Sin esto,
     # el handler con chats=-100... falla con "Cannot find any entity corresponding to ...".
     await client.get_dialogs()
+
+    # Seed: marcar el backlog actual como YA VISTO para no re-accionar senales viejas al
+    # arrancar (todas estarian vencidas). A partir de aqui solo se acciona lo NUEVO; el
+    # polling fallback cubre cualquier hueco si telethon se cae despues.
+    from listener import channel_ref
+    try:
+        backlog = await client.get_messages(channel_ref(), limit=config.POLL_LIMIT)
+        for m in backlog:
+            _remember(int(m.id))
+        print(f"Backlog sembrado: {len(backlog)} mensajes marcados como vistos.")
+    except Exception as exc:  # noqa: BLE001
+        logger.log_error("amain.seed_backlog", exc)
+
     print(f"Escuchando canal: {config.TG_CHANNEL}")
+
+    # Watchdogs: polling de respaldo (cero senales perdidas) + keep-alive de IQ.
+    poll_task = asyncio.create_task(poll_channel(client, broker))
+    keep_task = asyncio.create_task(iq_keepalive(broker))
 
     try:
         await client.run_until_disconnected()
     finally:
+        poll_task.cancel()
+        keep_task.cancel()
         await broker.disconnect()
 
 
