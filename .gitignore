@@ -1,0 +1,21 @@
+# Secretos
+.env
+
+# Sesiones de telethon
+*.session
+*.session-journal
+
+# Logs / datos
+logs/
+*.log
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Estado temporal de login telethon
+.login_state.json
