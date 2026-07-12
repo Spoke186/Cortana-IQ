@@ -102,6 +102,38 @@ def log_cycle(
             csv.DictWriter(f, fieldnames=CYCLE_FIELDS).writerow({k: _to_str(v) for k, v in row.items()})
 
 
+DEMO_FIELDS = [
+    "timestamp", "cycle_id", "par", "bucket", "stake_usado",
+    "gale_level_resuelto", "outcome", "atr_14_5m", "pnl_ciclo",
+]
+
+
+def log_entry(
+    *,
+    timestamp: str,
+    cycle_id: str,
+    par: str,
+    bucket: str,                 # "REAL" | "OTC"
+    stake_usado: Decimal,
+    gale_level_resuelto: int,    # 0 = entrada, 1 = se jugo el gale 1
+    outcome: str,                # "WIN_DIRECTO" | "WIN_GALE" | "LOSS"
+    atr_14_5m: float,            # valor CRUDO continuo; NaN si no se pudo calcular
+    pnl_ciclo: Decimal,
+) -> None:
+    """Una fila por ciclo para la corrida de recoleccion (handoff 2026-06-23, §4)."""
+    import math
+    atr_str = "NaN" if (atr_14_5m is None or math.isnan(atr_14_5m)) else f"{atr_14_5m:.8f}"
+    row = {
+        "timestamp": timestamp, "cycle_id": cycle_id, "par": par, "bucket": bucket,
+        "stake_usado": stake_usado, "gale_level_resuelto": gale_level_resuelto,
+        "outcome": outcome, "atr_14_5m": atr_str, "pnl_ciclo": pnl_ciclo,
+    }
+    with _LOCK:
+        _ensure_header(config.DEMO_CSV, DEMO_FIELDS)
+        with config.DEMO_CSV.open("a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=DEMO_FIELDS).writerow({k: _to_str(v) for k, v in row.items()})
+
+
 def log_error(where: str, exc: BaseException | str) -> None:
     """errors.log: fallos de API, Telegram, parsing, timing. NUNCA tragar errores en silencio (§8, §14)."""
     line = f"{_now_iso()} [{where}] {exc!r}\n" if isinstance(exc, BaseException) else f"{_now_iso()} [{where}] {exc}\n"

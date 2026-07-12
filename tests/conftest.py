@@ -9,7 +9,9 @@ import os
 _DUMMY = {
     "TG_API_ID": "1",
     "TG_API_HASH": "dummy",
-    "TG_CHANNEL": "dummy_channel",
+    "TG_CHANNEL": "-1000000000001",       # numerico: el registro multicanal necesita int
+    "TG_CH_CONSISTENTES": "-1000000000002",
+    "TG_CH_GOLD": "-1000000000003",
     "IQ_EMAIL": "dummy@example.com",
     "IQ_PASSWORD": "dummy",
     "IQ_ACCOUNT_TYPE": "practice",

@@ -32,9 +32,22 @@ def _parse_hhmm(hhmm: str) -> tuple[int, int]:
     return int(h), int(m)
 
 
-def build_schedule(signal: Signal, now_utc: datetime | None = None) -> Schedule:
+def build_schedule(
+    signal: Signal,
+    now_utc: datetime | None = None,
+    *,
+    tz: str | None = None,
+    max_levels: int | None = None,
+    step_minutes: int | None = None,
+) -> Schedule:
     """
-    Calcula las horas UTC de entrada y de los dos Gale.
+    Calcula las horas UTC de entrada y de los Gale.
+
+    Multicanal (2026-07-11): tz/max_levels/step por PROVEEDOR. Defaults = config (canal 'main').
+      - tz          : zona horaria de la HORA de la senal del proveedor.
+      - max_levels  : niveles de Gale (0 = sin martingala -> solo entrada).
+      - step_minutes: separacion entre niveles = expiracion del contrato (M1->1, M5->5).
+                      Default: signal.duration_min (M1/M5) o config.GALE_STEP_MINUTES.
 
     Cruce de medianoche (§2): los Gale se calculan con timedelta sobre el datetime
     aware, asi que rolar al dia siguiente es automatico y correcto.
@@ -50,34 +63,56 @@ def build_schedule(signal: Signal, now_utc: datetime | None = None) -> Schedule:
     if now_utc.tzinfo is None:
         raise ValueError("now_utc debe ser timezone-aware (UTC)")
 
-    sig_tz = ZoneInfo(config.SIGNAL_TIMEZONE)
+    if tz is None:
+        tz = config.SIGNAL_TIMEZONE
+    if max_levels is None:
+        max_levels = config.MAX_GALE_LEVELS
+    if step_minutes is None:
+        step_minutes = getattr(signal, "duration_min", None) or config.GALE_STEP_MINUTES
+
+    sig_tz = ZoneInfo(tz)
     disp_tz = ZoneInfo(config.DISPLAY_TIMEZONE)
 
     now_sig = now_utc.astimezone(sig_tz)
     hh, mm = _parse_hhmm(signal.entry_hhmm)
 
-    entry_sig = now_sig.replace(hour=hh, minute=mm, second=0, microsecond=0)
-
-    stale_window = timedelta(hours=config.STALE_SIGNAL_HOURS)
-    if entry_sig <= now_sig:
-        past_by = now_sig - entry_sig
-        if past_by > stale_window:
-            # Muy en el pasado -> es la HH:MM de manana.
-            entry_sig = entry_sig + timedelta(days=1)
-        else:
-            # Paso hace poco -> senal vencida, no operar (§2).
+    entry_date = getattr(signal, "entry_date", None)
+    if entry_date:
+        # LISTA DIARIA con fecha en el header: agendar en esa fecha EXACTA. Si ya paso -> vencida
+        # (NO rodar al futuro; asi las listas de dias anteriores se saltan enteras). (multicanal)
+        y, mo, d = (int(x) for x in entry_date.split("-"))
+        entry_sig = datetime(y, mo, d, hh, mm, tzinfo=sig_tz)
+        if entry_sig <= now_sig:
             return Schedule(
                 skipped=True,
-                reason=f"senal vencida (entrada {signal.entry_hhmm} ya paso hace {past_by})",
+                reason=f"senal vencida (lista {entry_date} {signal.entry_hhmm} ya paso)",
                 run_times_utc=[],
                 entry_local_signal=entry_sig,
                 entry_local_display=entry_sig.astimezone(disp_tz),
             )
+    else:
+        # Canal en vivo 'main' (sin fecha): heuristica hoy/manana (§2).
+        entry_sig = now_sig.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        stale_window = timedelta(hours=config.STALE_SIGNAL_HOURS)
+        if entry_sig <= now_sig:
+            past_by = now_sig - entry_sig
+            if past_by > stale_window:
+                # Muy en el pasado -> es la HH:MM de manana.
+                entry_sig = entry_sig + timedelta(days=1)
+            else:
+                # Paso hace poco -> senal vencida, no operar (§2).
+                return Schedule(
+                    skipped=True,
+                    reason=f"senal vencida (entrada {signal.entry_hhmm} ya paso hace {past_by})",
+                    run_times_utc=[],
+                    entry_local_signal=entry_sig,
+                    entry_local_display=entry_sig.astimezone(disp_tz),
+                )
 
-    # Horas de ejecucion: entrada, +5, +10 (sobre el datetime aware -> cruce de medianoche ok).
+    # Horas de ejecucion: entrada, +step, +2*step (sobre datetime aware -> cruce de medianoche ok).
     run_times_utc: list[datetime] = []
-    for level in range(config.MAX_GALE_LEVELS + 1):
-        t_sig = entry_sig + timedelta(minutes=config.GALE_STEP_MINUTES * level)
+    for level in range(max_levels + 1):
+        t_sig = entry_sig + timedelta(minutes=step_minutes * level)
         run_times_utc.append(t_sig.astimezone(timezone.utc))
 
     # Cruce con las horas de Gale declaradas por el canal (§1.4): warn pero usar las derivadas.

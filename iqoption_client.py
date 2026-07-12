@@ -79,6 +79,37 @@ logging.getLogger().addFilter(_DropIqNoise())
 
 
 # ----------------------------------------------------------------------
+#  Parche: get_instruments() de iqoptionapi NO acota su espera.
+# ----------------------------------------------------------------------
+# La version de la lib hace `while self.api.instruments is None:` (infinito) con un
+# `while ...: pass` interno (busy-wait SIN sleep). Si el backend no devuelve la lista de
+# instruments, queda en BUCLE INFINITO al 100% CPU; y como es Python puro, RETIENE EL GIL ->
+# mata el event loop de asyncio: Telethon nunca arranca y el bot queda SORDO a las senales.
+# Visto en vivo 2026-06-24: update_ACTIVES_OPCODE() colgado en get_instruments al arrancar.
+# Lo reemplazamos por una version ACOTADA que reintenta con sleep (no quema CPU ni retiene el GIL)
+# y LANZA tras un deadline. Asi update_ACTIVES_OPCODE() falla limpio y _connect_sync sigue con la
+# lista ACTIVES congelada (mejor un bot arrancado con actives algo viejos que un bot colgado).
+def _bounded_get_instruments(self, type, _deadline_s: float = 20.0, _gap_s: float = 2.0):  # noqa: A002
+    time.sleep(getattr(self, "suspend", 0))
+    self.api.instruments = None
+    deadline = time.time() + _deadline_s
+    while self.api.instruments is None:
+        if time.time() > deadline:
+            raise TimeoutError(f"get_instruments({type}) sin respuesta en {_deadline_s}s")
+        try:
+            self.api.get_instruments(type)
+        except Exception:  # noqa: BLE001 - no reconectar en bucle (la lib hacia self.connect() infinito)
+            pass
+        waited = time.time()
+        while self.api.instruments is None and time.time() - waited < _gap_s:
+            time.sleep(0.1)  # espera con sleep, NO 'pass'
+    return self.api.instruments
+
+
+IQ_Option.get_instruments = _bounded_get_instruments
+
+
+# ----------------------------------------------------------------------
 #  Mapeo de simbolos
 # ----------------------------------------------------------------------
 def to_iq_symbol(par: str) -> str:
@@ -110,6 +141,7 @@ class Proposal:
     asset: str = ""
     action: str = ""        # 'call' | 'put'
     stake: Decimal = Decimal("0")
+    duration_min: int = 5   # expiracion del contrato en minutos (M1->1, M5->5)
 
     @property
     def payout_fraction(self) -> Decimal:
@@ -210,6 +242,73 @@ class IQClient:
         bal = await self._run(self.iq.get_balance)
         return Decimal(str(bal))
 
+    def _get_atr_sync(self, iq_symbol: str, n: int, interval: int) -> float:
+        """
+        ATR simple de n velas (TR medio). Mide volatilidad del par en la TF de expiracion (5m).
+        Valor CRUDO continuo (sin umbral). Devuelve NaN si no hay datos suficientes (§3 handoff).
+        """
+        exists, asset = self._resolve_sync(iq_symbol)
+        if not exists or asset is None:
+            return float("nan")
+        try:
+            candles = self.iq.get_candles(asset, interval, n + 1, int(time.time()))  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001 - cualquier fallo de la lib -> NaN, no romper el ciclo
+            return float("nan")
+        if not candles or len(candles) < n + 1:
+            return float("nan")
+        trs = []
+        for i in range(1, len(candles)):
+            hi = float(candles[i]["max"]); lo = float(candles[i]["min"]); prev_close = float(candles[i - 1]["close"])
+            trs.append(max(hi - lo, abs(hi - prev_close), abs(lo - prev_close)))
+        trs = trs[-n:]
+        return sum(trs) / len(trs) if trs else float("nan")
+
+    async def get_atr(self, iq_symbol: str, n: int = 14, interval: int = 300) -> float:
+        """ATR de n velas (default 14) en velas de 'interval' seg (default 300=5m). NaN si no se puede."""
+        assert self.iq is not None
+        try:
+            return await self._run(self._get_atr_sync, iq_symbol, n, interval)
+        except Exception as exc:  # noqa: BLE001 - nunca romper el ciclo por el ATR (es solo dato)
+            logger.log_error("get_atr", exc)
+            return float("nan")
+
+    @staticmethod
+    def _ema(vals: list[float], period: int) -> float:
+        k = 2 / (period + 1)
+        e = vals[0]
+        for v in vals[1:]:
+            e = v * k + e * (1 - k)
+        return e
+
+    def _trend_sync(self, iq_symbol: str, interval: int, fast: int, slow: int) -> str | None:
+        """
+        Tendencia por cruce de EMAs (rapida vs lenta) en velas de 'interval' seg, calculada sobre
+        las velas CERRADAS mas recientes. Devuelve 'CALL' (alcista), 'PUT' (bajista) o None si no
+        hay datos suficientes (ante duda -> None = no filtrar, se opera).
+        """
+        exists, asset = self._resolve_sync(iq_symbol)
+        if not exists or asset is None:
+            return None
+        need = slow + 2
+        try:
+            candles = self.iq.get_candles(asset, interval, need, int(time.time()))  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            return None
+        if not candles or len(candles) < need:
+            return None
+        # Excluir la vela en curso (ultima, aun abierta): usar solo cerradas.
+        closes = [float(c["close"]) for c in candles[:-1]]
+        return "CALL" if self._ema(closes, fast) > self._ema(closes, slow) else "PUT"
+
+    async def get_trend(self, iq_symbol: str, interval: int, fast: int, slow: int) -> str | None:
+        """Direccion de la tendencia ('CALL'|'PUT') o None si no se puede medir (no filtrar)."""
+        assert self.iq is not None
+        try:
+            return await self._run(self._trend_sync, iq_symbol, interval, fast, slow)
+        except Exception as exc:  # noqa: BLE001 - ante fallo, None = no filtrar (no romper el ciclo)
+            logger.log_error("get_trend", exc)
+            return None
+
     def _resolve_sync(self, base: str) -> tuple[bool, str | None]:
         """(existe_en_IQ, asset_abierto_o_None). Prefiere par real, cae a -OTC."""
         cands = _candidates(base)
@@ -234,10 +333,13 @@ class IQClient:
             raise RuntimeError(f"payout turbo no disponible para {asset}: {frac!r}")
         return Decimal(str(frac))
 
-    async def get_proposal(self, iq_symbol: str, contract_type: str, amount: Decimal) -> Proposal:
+    async def get_proposal(
+        self, iq_symbol: str, contract_type: str, amount: Decimal, duration_min: int = 5,
+    ) -> Proposal:
         """
         IQ no tiene 'proposal'. Sintetiza una: resuelve el asset abierto, lee el payout REAL
         de turbo (fraccion, ej. 0.87) y arma costo=stake / bruto=stake*(1+frac).
+        'duration_min' (M1/M5) viaja en la proposal para que la compra use la expiracion correcta.
         """
         assert self.iq is not None
         exists, asset = await self._run(self._resolve_sync, iq_symbol)
@@ -249,16 +351,16 @@ class IQClient:
         payout = (amount * (Decimal("1") + frac))
         return Proposal(
             id=asset, ask_price=ask, payout=payout, spot=None,
-            asset=asset, action=action, stake=amount,
+            asset=asset, action=action, stake=amount, duration_min=duration_min,
         )
 
     # ---- compra + liquidacion ----------------------------------------
-    def _buy_and_wait_sync(self, asset: str, action: str, stake: float, timeout_s: float) -> dict:
+    def _buy_and_wait_sync(self, asset: str, action: str, stake: float, timeout_s: float, duration_min: int) -> dict:
         iq = self.iq
         assert iq is not None
         if asset not in OP_code.ACTIVES:
             raise RuntimeError(f"asset desconocido en constantes IQ: {asset}")
-        ok, order_id = iq.buy(stake, asset, action, config.CONTRACT_DURATION)
+        ok, order_id = iq.buy(stake, asset, action, duration_min)
         if not ok or order_id is None:
             raise RuntimeError(f"buy IQ rechazado: asset={asset} action={action} id={order_id!r}")
 
@@ -284,10 +386,10 @@ class IQClient:
     async def buy_and_settle(self, proposal: Proposal, *, timeout_s: float | None = None) -> Settlement:
         assert self.iq is not None
         if timeout_s is None:
-            timeout_s = config.CONTRACT_DURATION * 60 + 120  # contrato + margen de settlement
+            timeout_s = proposal.duration_min * 60 + 120  # contrato + margen de settlement
         r = await self._run(
             self._buy_and_wait_sync, proposal.asset, proposal.action,
-            float(proposal.stake), timeout_s,
+            float(proposal.stake), timeout_s, proposal.duration_min,
         )
         win = r["win"]
         if win == "win":

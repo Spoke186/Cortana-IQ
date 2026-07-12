@@ -19,16 +19,18 @@ def test_conversion_utc3_a_utc():
     assert sched.run_times_utc[0] == datetime(2026, 6, 19, 3, 45, tzinfo=UTC)
 
 
-def test_gale_times_mas_5_y_10():
+def test_gale_times_mas_5():
+    # MAX_GALE_LEVELS=2: entrada + Gale 1 (+5) + Gale 2 (+10).
     now = datetime(2026, 6, 19, 3, 0, tzinfo=UTC)
     sched = build_schedule(_sig("00:45"), now_utc=now)
+    assert len(sched.run_times_utc) == 3
     assert sched.run_times_utc[1] == datetime(2026, 6, 19, 3, 50, tzinfo=UTC)  # +5
     assert sched.run_times_utc[2] == datetime(2026, 6, 19, 3, 55, tzinfo=UTC)  # +10
 
 
 def test_cruce_de_medianoche():
     # now = 23:50 en Sao Paulo (2026-06-19). Senal 23:58 -> entrada 02:58 UTC del dia 20.
-    # Gale1 (00:03 local del 20) -> 03:03 UTC; Gale2 (00:08) -> 03:08 UTC.
+    # Gale1 (00:03 local del 20) -> 03:03 UTC. Gale2 (00:08 local) -> 03:08 UTC.
     now = datetime(2026, 6, 20, 2, 50, tzinfo=UTC)  # = 2026-06-19 23:50 Sao Paulo
     sched = build_schedule(_sig("23:58"), now_utc=now)
     assert not sched.skipped

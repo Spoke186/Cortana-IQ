@@ -23,6 +23,13 @@ SIGNAL_RE = re.compile(
     r"(?P<hora>\d{2}:\d{2})"               # hora de entrada HH:MM (TZ de la senal = UTC-3)
     r"\s*;\s*"
     r"(?P<dir>(?i:PUT|CALL))"              # direccion (case-insensitive, se normaliza)
+    # CRITICO: NO accionar los RESUMENES de resultados del canal. El senalero postea recaps
+    # con formato identico al de una entrada pero seguido de '->WIN/->LOSS':
+    #   "USD/ZAR; 00:35; PUT->WIN ✅\nUSD/ZAR; 00:45; PUT->LOSS ❌\n7 WINS / 3 LOSS"
+    # Sin este lookahead, SIGNAL_RE.search() pesca el PRIMER 'PAR;HH:MM;DIR' del recap y el bot
+    # opera un par que el canal NUNCA mando como entrada (bug real: USD/ZAR operado desde recaps).
+    # Una entrada real termina en emoji/fin de linea, jamas en flecha de resultado.
+    r"(?!\s*(?:-+>|—+>|→))"                # rechaza '->', '-->', '—>', '→' (linea de resultado)
 )
 
 # Lineas de Gale declaradas por el canal: "TIEMPO HASTA 00:50", "1er GALE —> TIEMPO HASTA 00:55"
@@ -31,13 +38,20 @@ GALE_TIME_RE = re.compile(r"TIEMPO\s+HASTA\s+(?P<hora>\d{2}:\d{2})", re.IGNORECA
 
 @dataclass(frozen=True)
 class Signal:
-    """Senal de entrada parseada. La hora esta en la TZ de la senal (UTC-3), aun sin convertir."""
+    """Senal de entrada parseada. La hora esta en la TZ del PROVEEDOR (ver source), aun sin convertir."""
     par: str            # "USD/TRY"
     entry_hhmm: str     # "00:45"
     direction: str      # "PUT" | "CALL"
     raw: str = ""       # texto original (para logging/depuracion)
     # Horas de Gale que el canal declaro (HH:MM), para cruzar contra las derivadas (§1.4).
     declared_gale_hhmm: list[str] = field(default_factory=list)
+    # Multicanal (2026-07-11): expiracion del contrato (min) y proveedor que la emitio.
+    duration_min: int = 5           # 1 (M1) | 5 (M5). Define tambien el paso de Gale.
+    source: str = "main"            # key del proveedor (providers.py)
+    # Fecha CALENDARIO de la entrada (ISO 'YYYY-MM-DD' en la TZ del proveedor) para las listas
+    # diarias con fecha en el header. None = canal en vivo 'main' (el scheduler infiere hoy/manana).
+    # Con fecha, el scheduler agenda en esa fecha EXACTA y salta si ya paso (no rueda al futuro).
+    entry_date: str | None = None
 
     @property
     def iq_contract_type(self) -> str:

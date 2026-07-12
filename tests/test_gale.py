@@ -26,14 +26,15 @@ def test_entrada_siempre_initial_stake():
 
 
 def test_ceil_valores():
-    plan = plan_cycle(PAYOUT, INIT, rounding="ceil")
+    # max_gale_levels=2 explicito: valida la formula a 3 niveles aunque produccion opere 1.
+    plan = plan_cycle(PAYOUT, INIT, rounding="ceil", max_gale_levels=2)
     assert plan.stakes == [Decimal("1.00"), Decimal("2.12"), Decimal("4.47")]
     assert plan.worst_case_loss == Decimal("7.59")
 
 
 def test_nearest_valores_tabla_referencia():
-    # Reproduce la tabla §4.2 / §13.4 del documento.
-    plan = plan_cycle(PAYOUT, INIT, rounding="nearest")
+    # Reproduce la tabla §4.2 / §13.4 del documento (3 niveles, formula).
+    plan = plan_cycle(PAYOUT, INIT, rounding="nearest", max_gale_levels=2)
     assert plan.stakes == [Decimal("1.00"), Decimal("2.11"), Decimal("4.46")]
     assert plan.worst_case_loss == Decimal("7.57")
 
